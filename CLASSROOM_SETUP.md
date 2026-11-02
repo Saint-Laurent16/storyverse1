@@ -21,6 +21,8 @@ This upgrade adds teacher/student accounts, private classrooms with join codes, 
 
 ## B. Create the database tables and security rules
 
+If you already ran the STORYVERSE classroom schema successfully in this same Supabase project, do not run a second copy just for the website upload. Use the schema file as a reference and only run a missing setup step if your SQL Editor reports that it has not been applied.
+
 1. Open the new Supabase project.
 2. Open **SQL Editor**.
 3. Choose **New query**.
@@ -31,6 +33,8 @@ This upgrade adds teacher/student accounts, private classrooms with join codes, 
 The schema creates the profiles, classrooms, class memberships, assignments, scene progress, quiz attempts, and pre/post assessment tables. It also enables Row Level Security and adds database functions for creating/joining classes, storing a requested account type without granting teacher privileges, validating scene progress, and scoring quizzes. Student scene progress is written through a database function that verifies class membership and story assignment; students do not receive direct write access to the progress table.
 
 ### Load the private quiz answer key
+
+If you already ran the matching private answer-key SQL successfully, you do not need to run it again. The supplied script uses `ON CONFLICT` and can also be safely rerun if you need to restore/update the three story keys.
 
 1. In Supabase SQL Editor, start another **New query**.
 2. Open the separate `PRIVATE_QUIZ_ANSWER_KEY.sql` file supplied alongside the website ZIP.
@@ -57,24 +61,9 @@ If your GitHub username or repository name changes, replace the URL with your ac
 
 In **Authentication → Sign In / Providers → Email**, keep email/password sign-in enabled. Email confirmation is recommended. Supabase's built-in email sender has sending limits; for a school pilot with several accounts, coordinate sign-ups in small batches or configure a trusted SMTP provider if needed.
 
-### Enable Google sign-in (the second login option)
+### Email/password sign-in only
 
-Google sign-in needs one free OAuth setup in addition to the website button:
-
-1. Open <https://console.cloud.google.com/> and select or create a Google Cloud project.
-2. Open **Google Auth Platform → Clients** (or the OAuth credentials area in the console) and create an OAuth client. Choose **Web application**.
-3. Under **Authorized JavaScript origins**, add:
-
-   `https://saint-laurent16.github.io`
-
-4. Under **Authorized redirect URIs**, add the Supabase callback URL shown in your Supabase project under **Authentication → Sign In / Providers → Google**. It usually looks like:
-
-   `https://YOUR_PROJECT_REF.supabase.co/auth/v1/callback`
-
-5. Copy the Google OAuth **Client ID** and **Client secret** into the Google provider settings in Supabase, enable Google, and save.
-6. Keep the Client secret inside Supabase only. **Never paste it into GitHub, HTML, or JavaScript.**
-
-The STORYVERSE Google button lets the user choose Student or Teacher before redirecting. For a new Google account, the site records that as a requested role. A teacher request still remains a student-level account until the project administrator approves it using the SQL in section F. Supabase's `redirectTo` must be allow-listed in URL Configuration; the `classroom.html` redirect listed above is already the one this site uses.
+This version uses email and password only. Google sign-in is not required and does not need to be enabled in Supabase.
 
 ## D. Copy your public Supabase settings into the website
 
@@ -162,7 +151,6 @@ A teacher can create and manage multiple classrooms. Each classroom has its own 
 ## I. Testing checklist before the study
 
 - [ ] Register a test teacher using email/password and approve that teacher with the SQL query above.
-- [ ] Test Google sign-in with a separate test account (after Google provider setup); verify its chosen account type is applied.
 - [ ] Register a separate test student.
 - [ ] Create a classroom as the teacher and copy its code.
 - [ ] Join that classroom as the student.

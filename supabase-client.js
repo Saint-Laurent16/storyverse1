@@ -2,8 +2,8 @@
 // and Publishable key. Never put a Supabase Secret key in browser code.
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
 
-export const SUPABASE_URL = 'PASTE_YOUR_SUPABASE_PROJECT_URL_HERE';
-export const SUPABASE_PUBLISHABLE_KEY = 'PASTE_YOUR_SUPABASE_PUBLISHABLE_KEY_HERE';
+export const SUPABASE_URL = 'https://dtkcpvcparxlbnghlunr.supabase.co';
+export const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_zXM_mo4SDRhr4s3Ptot5hQ_ZUi1iypX';
 
 export const supabaseConfigured =
   SUPABASE_URL.startsWith('https://') &&

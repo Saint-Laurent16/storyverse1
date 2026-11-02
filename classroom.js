@@ -3,7 +3,6 @@ import { supabase, supabaseConfigured } from './supabase-client.js';
 const $ = (s, r = document) => r.querySelector(s);
 const esc = (v = '') => String(v).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 const ACTIVE_CLASS_KEY = 'storyverse-active-class-v1';
-const GOOGLE_ROLE_KEY = 'storyverse-google-requested-role-v1';
 let currentUser = null;
 let currentProfile = null;
 let authMode = 'login';
@@ -46,7 +45,6 @@ async function handleAuthSubmit(event) {
   setBusy(button, true);
   try {
     if (authMode === 'login') {
-      sessionStorage.removeItem(GOOGLE_ROLE_KEY);
       const { error } = await supabase.auth.signInWithPassword({ email, password });
       if (error) throw error;
       notify('You are signed in. Welcome back!');
@@ -77,36 +75,6 @@ async function handleAuthSubmit(event) {
   } finally {
     setBusy(button, false);
   }
-}
-
-async function handleGoogleAuth() {
-  clearNotice();
-  const role = $('#googleRole').value;
-  const button = $('#googleAuthButton');
-  setBusy(button, true, 'CONNECTING…');
-  sessionStorage.setItem(GOOGLE_ROLE_KEY, role);
-  try {
-    const redirectTo = new URL('./classroom.html', window.location.href).href;
-    const { error } = await supabase.auth.signInWithOAuth({
-      provider: 'google',
-      options: { redirectTo },
-    });
-    if (error) throw error;
-  } catch (error) {
-    sessionStorage.removeItem(GOOGLE_ROLE_KEY);
-    notify(error.message || 'Google sign-in could not start. Check that Google is enabled in Supabase.', 'error');
-    setBusy(button, false);
-  }
-}
-
-async function applyPendingGoogleRole(user) {
-  const requestedRole = sessionStorage.getItem(GOOGLE_ROLE_KEY);
-  if (!requestedRole || !user) return;
-  const { error } = await supabase.rpc('set_storyverse_requested_role', {
-    p_requested_role: requestedRole,
-  });
-  if (error) throw error;
-  sessionStorage.removeItem(GOOGLE_ROLE_KEY);
 }
 
 async function loadProfile(user) {
@@ -390,7 +358,6 @@ async function init() {
   if (!supabaseConfigured || !supabase) {
     $('#configNotice').hidden = false;
     $('#authSubmit').disabled = true;
-    $('#googleAuthButton').disabled = true;
     $('#loginTab').disabled = true;
     $('#signupTab').disabled = true;
     return;
@@ -406,7 +373,6 @@ async function init() {
   $('#loginTab').addEventListener('click', () => setAuthMode('login'));
   $('#signupTab').addEventListener('click', () => setAuthMode('signup'));
   $('#authForm').addEventListener('submit', handleAuthSubmit);
-  $('#googleAuthButton').addEventListener('click', handleGoogleAuth);
   $('#createClassForm').addEventListener('submit', createClass);
   $('#joinClassForm').addEventListener('submit', joinClass);
   $('#signOut').addEventListener('click', signOut);
@@ -415,16 +381,12 @@ async function init() {
 
   const { data: { session } } = await supabase.auth.getSession();
   if (session?.user) {
-    try { await applyPendingGoogleRole(session.user); }
-    catch (error) { notify(error.message || 'Could not save the Google account type.', 'error'); }
     await renderSignedIn(session.user);
   }
   supabase.auth.onAuthStateChange((_event, sessionNow) => {
     if (sessionNow?.user) {
       // Avoid auth callback async work inside Supabase's auth lock callback.
       setTimeout(async () => {
-        try { await applyPendingGoogleRole(sessionNow.user); }
-        catch (error) { notify(error.message || 'Could not save the Google account type.', 'error'); }
         await renderSignedIn(sessionNow.user);
       }, 0);
     } else {

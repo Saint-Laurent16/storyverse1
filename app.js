@@ -21,6 +21,9 @@ let musicOn = false;
 let threeExperience = null;
 let quizState = null;
 let currentProgress = readProgress();
+let cloudSupabase = null;
+let cloudStudentId = null;
+let cloudClassId = null;
 
 function readProgress() {
   try {
@@ -135,6 +138,76 @@ function stopMusic() {
 }
 function toggleMusic() { musicOn ? stopMusic() : startMusic(); }
 
+// Optional cloud classroom link. The public story library still works without Supabase.
+// A class-linked story only syncs after the signed-in learner is verified as a member.
+async function initializeCloudClass(classId, storyId) {
+  try {
+    const module = await import('./supabase-client.js');
+    if (!module.supabaseConfigured || !module.supabase) {
+      showToast('Classroom sync is not configured yet. Ask your teacher to finish the Supabase setup.');
+      window.location.href = './classroom.html';
+      return false;
+    }
+    cloudSupabase = module.supabase;
+    const { data: sessionResult, error: sessionError } = await cloudSupabase.auth.getSession();
+    if (sessionError) throw sessionError;
+    const user = sessionResult?.session?.user;
+    if (!user) {
+      showToast('Please log in to your student account to open this assigned story.');
+      window.location.href = './classroom.html';
+      return false;
+    }
+    const { data: profile, error: profileError } = await cloudSupabase
+      .from('profiles').select('id,role').eq('id', user.id).maybeSingle();
+    if (profileError) throw profileError;
+    if (!profile || profile.role !== 'student') {
+      showToast('This assigned-story link is for a student account.');
+      window.location.href = './classroom.html';
+      return false;
+    }
+    const { data: membership, error: membershipError } = await cloudSupabase
+      .from('class_members').select('class_id').eq('class_id', classId).eq('student_id', user.id).maybeSingle();
+    if (membershipError) throw membershipError;
+    if (!membership) {
+      showToast('You are not a member of this class. Join with the code from your teacher first.');
+      window.location.href = './classroom.html';
+      return false;
+    }
+    if (storyId) {
+      const { data: assignment, error: assignmentError } = await cloudSupabase
+        .from('story_assignments').select('story_id').eq('class_id', classId).eq('story_id', storyId).maybeSingle();
+      if (assignmentError) throw assignmentError;
+      if (!assignment) {
+        showToast('This story is not assigned to your classroom yet.');
+        window.location.href = './classroom.html';
+        return false;
+      }
+    }
+    cloudStudentId = user.id;
+    cloudClassId = classId;
+    return true;
+  } catch (error) {
+    console.error('STORYVERSE class verification failed:', error);
+    showToast('Could not verify classroom access. Please return to Classroom Login and try again.');
+    window.location.href = './classroom.html';
+    return false;
+  }
+}
+
+async function syncCloudSceneProgress(scenesCompleted) {
+  if (!cloudSupabase || !cloudStudentId || !cloudClassId || !activeStory) return;
+  const { error } = await cloudSupabase.rpc('record_storyverse_scene_progress', {
+    p_class_id: cloudClassId,
+    p_story_id: activeStory.id,
+    p_scenes_completed: Math.max(1, Math.min(3, scenesCompleted)),
+  });
+  if (error) {
+    console.error('Could not sync scene progress:', error);
+    showToast('Saved on this device, but classroom progress did not sync. Check your connection.');
+  }
+}
+
+
 async function loadStories() {
   const response = await fetch('./data/stories.json', { cache: 'no-cache' });
   if (!response.ok) throw new Error('Could not load story content.');
@@ -149,6 +222,11 @@ async function loadStories() {
   renderProgress();
   const params = new URLSearchParams(location.search);
   const storyId = params.get('story');
+  const classId = params.get('class');
+  if (classId) {
+    const verified = await initializeCloudClass(classId, storyId);
+    if (!verified) return;
+  }
   if (storyId && findStory(storyId)) setTimeout(() => openStory(storyId), 500);
 }
 function validateStoryData(data) {
@@ -159,8 +237,7 @@ function validateStoryData(data) {
     }
     for (const scene of story.scenes) if (!scene.title || !scene.text) throw new Error(`A scene in "${story.title}" is missing a title or text.`);
     for (const question of story.quiz) {
-      if (!question.question || !Array.isArray(question.choices) || !Number.isInteger(question.answer)) throw new Error(`A quiz question in "${story.title}" is incomplete.`);
-      if (question.answer < 0 || question.answer >= question.choices.length) throw new Error(`A quiz answer in "${story.title}" points outside its choice list.`);
+      if (!question.question || !Array.isArray(question.choices) || question.choices.length < 2) throw new Error(`A quiz question in "${story.title}" is incomplete.`);
     }
   }
 }
@@ -248,6 +325,7 @@ function nextScene() {
   const prior = Number(currentProgress.scenes[activeStory.id] || 0);
   currentProgress.scenes[activeStory.id] = Math.max(prior, activeScene + 1);
   saveProgress();
+  void syncCloudSceneProgress(currentProgress.scenes[activeStory.id]);
   renderProgress();
   if (activeScene < 2) {
     activeScene += 1;
@@ -700,54 +778,95 @@ function renderQuizQuestion() {
     $$('[data-answer]').forEach(el => el.classList.toggle('selected', el === button));
     $('#quizNext').disabled = false;
   }));
-  $('#quizNext').textContent = 'CHECK ANSWER';
+  $('#quizNext').textContent = 'SAVE ANSWER';
   $('#quizNext').disabled = true;
 }
-function quizAdvance() {
+async function quizAdvance() {
   if (!quizState) return;
   if (!quizState.answered) {
     if (quizState.selected === null) return;
     const q = quizState.story.quiz[quizState.index];
-    const correct = quizState.selected === q.answer;
-    if (correct) quizState.score++;
-    quizState.responses.push({ correct, explanation: q.explanation, question: q.question });
-    quizState.answered = true;
-    $$('[data-answer]').forEach(button => {
-      const value = Number(button.dataset.answer);
-      button.disabled = true;
-      if (value === q.answer) button.classList.add('correct-answer');
-      else if (value === quizState.selected) button.classList.add('wrong-answer');
+    quizState.responses.push({
+      selected: quizState.selected,
+      question: q.question,
+      choices: q.choices,
+      explanation: q.explanation || '',
     });
+    quizState.answered = true;
+    $$('[data-answer]').forEach(button => { button.disabled = true; });
     const feedback = $('#answerFeedback');
     feedback.hidden = false;
-    feedback.className = `answer-feedback ${correct ? 'good' : 'bad'}`;
-    feedback.innerHTML = `<b>${correct ? 'That’s right!' : 'Not quite yet.'}</b> ${escapeHtml(q.explanation)}`;
-    $('#quizNext').textContent = quizState.index === quizState.story.quiz.length - 1 ? 'SEE MY SCORE' : 'NEXT QUESTION';
+    feedback.className = 'answer-feedback';
+    feedback.textContent = cloudSupabase && cloudStudentId && cloudClassId
+      ? 'Answer saved. Your teacher’s classroom will score the full quiz when you submit it.'
+      : 'Answer saved for this practice session. Join your teacher’s classroom and open the assigned story to submit a scored quiz.';
+    $('#quizNext').textContent = quizState.index === quizState.story.quiz.length - 1 ? 'SUBMIT QUIZ' : 'NEXT QUESTION';
   } else if (quizState.index < quizState.story.quiz.length - 1) {
     quizState.index++;
     renderQuizQuestion();
-  } else showQuizResult();
+  } else {
+    await showQuizResult();
+  }
 }
-function showQuizResult() {
+
+async function showQuizResult() {
   quizState.finished = true;
   const total = quizState.story.quiz.length;
-  const score = quizState.score;
-  const pct = Math.round(score / total * 100);
+  let score = null;
+  let submitMessage = '';
+
+  $('#quizNext').disabled = true;
+  $('#quizNext').textContent = 'SUBMITTING…';
+
+  if (cloudSupabase && cloudStudentId && cloudClassId) {
+    try {
+      const answers = quizState.responses.map(item => item.selected);
+      const { data, error } = await cloudSupabase.rpc('submit_storyverse_quiz', {
+        p_class_id: cloudClassId,
+        p_story_id: quizState.story.id,
+        p_answers: answers,
+      });
+      if (error) throw error;
+      const result = Array.isArray(data) ? data[0] : data;
+      if (!result || !Number.isInteger(Number(result.score)) || !Number.isInteger(Number(result.total))) {
+        throw new Error('The server returned an incomplete quiz result.');
+      }
+      score = Number(result.score);
+      submitMessage = 'Your scored result has been saved to your classroom.';
+    } catch (error) {
+      console.error('Quiz submission failed:', error);
+      submitMessage = 'We could not submit this quiz to your classroom. Check your internet connection, then ask your teacher to refresh the class dashboard. Your answers have not been counted as a saved score.';
+      showToast('Quiz score did not sync to your classroom.');
+    }
+  } else {
+    submitMessage = 'Practice session only. To record a score your teacher can see, log in, join a class with its code, and open this story from the assigned-stories list.';
+  }
+
   currentProgress.completed = [...new Set([...(currentProgress.completed || []), quizState.story.id])];
-  currentProgress.results = currentProgress.results || [];
-  currentProgress.results.unshift({ storyId: quizState.story.id, title: quizState.story.title, score, total, date: new Date().toISOString() });
-  currentProgress.results = currentProgress.results.slice(0, 12);
+  if (score !== null) {
+    currentProgress.results = currentProgress.results || [];
+    currentProgress.results.unshift({ storyId: quizState.story.id, title: quizState.story.title, score, total, date: new Date().toISOString() });
+    currentProgress.results = currentProgress.results.slice(0, 12);
+  }
   saveProgress();
   renderProgress();
-  $('#quizQuestionCounter').textContent = 'YOUR STORYVERSE RESULT';
+
+  const pct = score === null ? null : Math.round(score / total * 100);
+  $('#quizQuestionCounter').textContent = score === null ? 'PRACTICE SESSION' : 'YOUR STORYVERSE RESULT';
   $('#quizProgressLabel').textContent = '100%';
   $('#quizProgressBar').style.width = '100%';
   $('#quizContent').hidden = true;
   $('#quizNext').hidden = true;
   const result = $('#quizResult');
   result.hidden = false;
-  const message = pct >= 80 ? 'Excellent reading! You caught the important details and the bigger meaning.' : pct >= 60 ? 'Nice work! Review the explanations and notice what the story is teaching.' : 'Good effort. Revisit the scenes and try again to strengthen your understanding.';
-  result.innerHTML = `<strong>${score} / ${total}</strong><p><b>${pct}% · ${pct >= 80 ? 'STORY EXPLORER' : pct >= 60 ? 'CURIOUS READER' : 'KEEP PRACTISING'}</b><br/>${message}</p><div class="quiz-review">${quizState.responses.map((r,i)=>`<div class="review-line ${r.correct?'good':'bad'}">${r.correct?'✓':'↻'} ${escapeHtml(r.question)} — ${escapeHtml(r.explanation)}</div>`).join('')}</div>`;
+
+  const reviewHtml = quizState.responses.map((response) =>
+    `<div class="review-line">${escapeHtml(response.question)}<br/><span>Your answer: ${escapeHtml(response.choices[response.selected] || 'No answer')}</span><br/><span>${escapeHtml(response.explanation)}</span></div>`
+  ).join('');
+
+  const headline = score === null ? 'Quiz submitted status unavailable' : `${score} / ${total}`;
+  const performance = pct === null ? 'Practice mode' : `${pct}% · ${pct >= 80 ? 'STORY EXPLORER' : pct >= 60 ? 'CURIOUS READER' : 'KEEP PRACTISING'}`;
+  result.innerHTML = `<strong>${headline}</strong><p><b>${performance}</b><br/>${escapeHtml(submitMessage)}</p><div class="quiz-review">${reviewHtml}</div>`;
   const done = document.createElement('button');
   done.className = 'button button-primary';
   done.textContent = 'BACK TO STORYVERSE';
