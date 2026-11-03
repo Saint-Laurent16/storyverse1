@@ -36,8 +36,9 @@
       <a href="#library" class="nav-link">Explore Stories</a>
       <a href="#how" class="nav-link">How It Works</a>
       <a href="#progress" class="nav-link">My Progress</a>
-      <a href="./classroom.html" class="nav-link classroom-nav-link">Classroom Login</a>
+      <a href="#classroom" class="nav-link">Classroom</a>
       <button class="nav-scan" id="navScan"><span class="scan-dot"></span> Scan QR</button>
+      <button class="nav-account" id="accountButton">LOG IN / SIGN UP</button>
     </nav>
   </header>
 
@@ -50,7 +51,6 @@
         <div class="hero-actions">
           <button class="button button-primary" id="heroScan"><span class="button-icon">⌗</span> SCAN A STORY QR</button>
           <a class="button button-secondary" href="#library">BROWSE STORYBOOKS <span>↗</span></a>
-          <a class="button classroom-hero-button" href="./classroom.html">STUDENT / TEACHER LOGIN <span>→</span></a>
         </div>
         <div class="hero-features">
           <div class="feature-chip"><span class="feature-icon">✦</span><span><b>3 scenes</b><small>per story</small></span></div>
@@ -106,7 +106,7 @@
     </section>
 
     <section class="progress-section section-shell" id="progress">
-      <div class="section-heading progress-heading"><div><div class="eyebrow"><span class="eyebrow-line"></span> YOUR READING JOURNEY</div><h2>Look how far <em>you’ve come.</em></h2><p>Your progress is saved on this device. Use a nickname or study code—no account needed.</p></div><div class="profile-edit"><label for="studentName">YOUR DISPLAY NAME</label><div class="name-input-wrap"><input id="studentName" type="text" maxlength="24" placeholder="Story explorer" autocomplete="nickname" /><button id="saveName" aria-label="Save display name">✓</button></div></div></div>
+      <div class="section-heading progress-heading"><div><div class="eyebrow"><span class="eyebrow-line"></span> YOUR READING JOURNEY</div><h2>Look how far <em>you’ve come.</em></h2><p>Sign in to save your reading journey across devices and share progress with your classroom.</p></div><div class="profile-edit"><label for="studentName">YOUR DISPLAY NAME</label><div class="name-input-wrap"><input id="studentName" type="text" maxlength="40" placeholder="Sign in to see your name" autocomplete="nickname" readonly /><button id="saveName" aria-label="Account settings">↗</button></div><small class="profile-sync-note" id="profileSyncNote">Progress is stored on this device until you sign in.</small></div></div>
       <div class="progress-overview">
         <div class="stat-card"><span class="stat-icon violet">▣</span><strong id="statStories">0</strong><small>STORIES COMPLETED</small></div>
         <div class="stat-card"><span class="stat-icon cyan">✦</span><strong id="statScenes">0</strong><small>SCENES EXPLORED</small></div>
@@ -118,12 +118,44 @@
       </div>
     </section>
 
+
+    <section class="classroom-section section-shell" id="classroom">
+      <div class="section-heading">
+        <div><div class="eyebrow"><span class="eyebrow-line"></span> YOUR LEARNING SPACE</div><h2>Welcome to your <em>classroom.</em></h2><p>Teachers create private class spaces. Students join with a class code. Reading and quiz progress syncs to the teacher dashboard.</p></div>
+      </div>
+      <div class="classroom-panel" id="classroomPanel"><div class="classroom-empty"><div class="classroom-empty-icon">✦</div><h3>Your STORYVERSE classroom starts here.</h3><p>Log in or create a teacher or student account to continue.</p><button class="button button-primary" id="classroomLoginButton">LOG IN / CREATE ACCOUNT</button></div></div>
+    </section>
+
     <section class="research-note section-shell">
       <div class="research-icon">✧</div><div><span class="panel-kicker">MADE FOR CURIOUS MINDS</span><h3>Read more. Understand more. Imagine more.</h3><p>STORYVERSE is a learning experience designed to support English reading comprehension through storytelling, audio, interactive exploration, and reflection.</p></div>
     </section>
   </main>
 
-  <footer class="site-footer section-shell"><a class="brand footer-brand" href="#home"><span class="brand-mark"><span></span><span></span><span></span></span><span>STORY<span class="brand-accent">VERSE</span></span></a><p>Every page is a portal. Every reader is an explorer.</p><div class="footer-links"><a href="#library">Stories</a><a href="#how">How it works</a><a href="./classroom.html">Teacher &amp; Student Login</a><button id="openEditor">Editor studio</button></div><small>© <span id="yearNow"></span> STORYVERSE · A reading adventure</small></footer>
+  <footer class="site-footer section-shell"><a class="brand footer-brand" href="#home"><span class="brand-mark"><span></span><span></span><span></span></span><span>STORY<span class="brand-accent">VERSE</span></span></a><p>Every page is a portal. Every reader is an explorer.</p><div class="footer-links"><a href="#library">Stories</a><a href="#how">How it works</a><button id="openEditor">Editor studio</button></div><small>© <span id="yearNow"></span> STORYVERSE · A reading adventure</small></footer>
+
+
+  <!-- Account access -->
+  <div class="modal-shell" id="authModal" aria-hidden="true">
+    <div class="modal-backdrop" data-close="auth"></div>
+    <section class="simple-modal auth-modal" role="dialog" aria-modal="true" aria-labelledby="authTitle">
+      <button class="icon-button modal-close" id="closeAuth" aria-label="Close account dialog">✕</button>
+      <div class="eyebrow"><span class="eyebrow-line"></span> YOUR STORYVERSE ACCOUNT</div>
+      <h2 id="authTitle">Welcome <em>back.</em></h2>
+      <p class="modal-intro" id="authIntro">Log in with your name and password to continue your reading journey.</p>
+      <div class="auth-tabs"><button type="button" class="auth-tab active" data-auth-mode="login">LOG IN</button><button type="button" class="auth-tab" data-auth-mode="register">CREATE ACCOUNT</button></div>
+      <form id="authForm" class="auth-form">
+        <label for="authName">NAME</label>
+        <input id="authName" name="name" type="text" maxlength="70" placeholder="Enter your name" autocomplete="username" required />
+        <div id="authRoleWrap" hidden><label for="authRole">I AM A</label><select id="authRole" name="role"><option value="student">Student</option><option value="teacher">Teacher</option></select></div>
+        <label for="authPassword">PASSWORD</label>
+        <input id="authPassword" name="password" type="password" minlength="8" placeholder="At least 8 characters" autocomplete="current-password" required />
+        <div id="authConfirmWrap" hidden><label for="authConfirm">CONFIRM PASSWORD</label><input id="authConfirm" type="password" minlength="8" placeholder="Enter your password again" autocomplete="new-password" /></div>
+        <p class="auth-privacy-note">No email address is needed. Choose a name that is unique in STORYVERSE. For student research, consider using an approved participant name or study code rather than a full legal name.</p>
+        <div class="auth-error" id="authError" role="status" aria-live="polite"></div>
+        <button class="button button-primary auth-submit" id="authSubmit" type="submit">LOG IN</button>
+      </form>
+    </section>
+  </div>
 
   <!-- Story experience -->
   <div class="modal-shell" id="storyModal" aria-hidden="true">

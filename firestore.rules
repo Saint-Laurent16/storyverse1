@@ -1,0 +1,99 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+    function userPath(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+    function hasUser(uid) {
+      return exists(userPath(uid));
+    }
+    function userRole(uid) {
+      return get(userPath(uid)).data.role;
+    }
+    function isTeacher() {
+      return signedIn() && hasUser(request.auth.uid) && userRole(request.auth.uid) == 'teacher';
+    }
+    function classPath(classCode) {
+      return /databases/$(database)/documents/classrooms/$(classCode);
+    }
+    function hasClass(classCode) {
+      return exists(classPath(classCode));
+    }
+    function isClassOwner(classCode) {
+      return signedIn() && hasClass(classCode) && get(classPath(classCode)).data.ownerUid == request.auth.uid;
+    }
+    function isStudent() {
+      return signedIn() && hasUser(request.auth.uid) && userRole(request.auth.uid) == 'student';
+    }
+    function isClassMember(classCode, uid) {
+      return exists(/databases/$(database)/documents/classrooms/$(classCode)/members/$(uid));
+    }
+
+    match /users/{uid} {
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() >= 2
+        && request.resource.data.displayName.size() <= 70
+        && request.resource.data.role in ['teacher', 'student']
+        && request.resource.data.joinedClassCodes is list
+        && request.resource.data.joinedClassCodes.size() == 0;
+      allow get, read: if signedIn() && request.auth.uid == uid;
+      allow update: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.displayName == resource.data.displayName
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['joinedClassCodes', 'lastSeenAt']);
+      allow delete: if false;
+
+      match /progress/{storyId} {
+        allow read, create, update, delete: if signedIn() && request.auth.uid == uid;
+      }
+    }
+
+    match /classrooms/{classCode} {
+      // The class code is an invitation secret. Authenticated students can fetch a code they were given,
+      // but cannot list/search all classrooms.
+      allow get: if signedIn();
+      allow list: if isTeacher() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isTeacher()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.teacherName is string
+        && request.resource.data.className is string
+        && request.resource.data.className.size() >= 2
+        && request.resource.data.className.size() <= 60
+        && request.resource.data.isActive == true;
+      allow update: if isClassOwner(classCode)
+        && request.resource.data.ownerUid == resource.data.ownerUid;
+      allow delete: if isClassOwner(classCode);
+
+      match /members/{memberUid} {
+        allow create: if signedIn()
+          && request.auth.uid == memberUid
+          && isStudent()
+          && hasClass(classCode)
+          && get(classPath(classCode)).data.isActive == true
+          && request.resource.data.uid == memberUid
+          && request.resource.data.studentName == get(userPath(memberUid)).data.displayName;
+        allow get: if signedIn() && (request.auth.uid == memberUid || isClassOwner(classCode));
+        allow list: if isClassOwner(classCode);
+        allow update, delete: if false;
+
+        match /progress/{storyId} {
+          allow read: if signedIn() && (request.auth.uid == memberUid || isClassOwner(classCode));
+          allow create, update: if signedIn()
+            && request.auth.uid == memberUid
+            && isClassMember(classCode, memberUid)
+            && request.resource.data.storyId == storyId
+            && request.resource.data.scenesCompleted is number
+            && request.resource.data.scenesCompleted >= 0
+            && request.resource.data.scenesCompleted <= 3;
+          allow delete: if false;
+        }
+      }
+    }
+  }
+}

@@ -1,8 +1,19 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { firebaseConfig, isFirebaseConfigured } from './firebase-config.js';
 
 const STORAGE_KEY = 'storyverse-progress-v1';
 const EDITOR_KEY = 'storyverse-editor-v1';
+const FIREBASE_SDK_VERSION = '13.1.0';
+let firebaseAuth = null;
+let firebaseDb = null;
+let firebaseApi = null;
+let signedInUser = null;
+let signedInProfile = null;
+let authMode = 'login';
+let authActionInProgress = false;
+let classroomRefreshToken = 0;
+let progressSyncQueue = Promise.resolve();
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const stageEl = $('#sceneStage');
@@ -21,19 +32,19 @@ let musicOn = false;
 let threeExperience = null;
 let quizState = null;
 let currentProgress = readProgress();
-let cloudSupabase = null;
-let cloudStudentId = null;
-let cloudClassId = null;
 
-function readProgress() {
+function readProgress(key = STORAGE_KEY) {
   try {
-    return JSON.parse(localStorage.getItem(STORAGE_KEY)) || { name: '', scenes: {}, completed: [], results: [] };
+    return JSON.parse(localStorage.getItem(key)) || { name: '', scenes: {}, completed: [], results: [] };
   } catch {
     return { name: '', scenes: {}, completed: [], results: [] };
   }
 }
+function activeProgressKey() {
+  return signedInUser ? `${STORAGE_KEY}-${signedInUser.uid}` : STORAGE_KEY;
+}
 function saveProgress() {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(currentProgress)); }
+  try { localStorage.setItem(activeProgressKey(), JSON.stringify(currentProgress)); }
   catch { showToast('This browser could not save progress.'); }
 }
 function escapeHtml(value = '') {
@@ -138,76 +149,6 @@ function stopMusic() {
 }
 function toggleMusic() { musicOn ? stopMusic() : startMusic(); }
 
-// Optional cloud classroom link. The public story library still works without Supabase.
-// A class-linked story only syncs after the signed-in learner is verified as a member.
-async function initializeCloudClass(classId, storyId) {
-  try {
-    const module = await import('./supabase-client.js');
-    if (!module.supabaseConfigured || !module.supabase) {
-      showToast('Classroom sync is not configured yet. Ask your teacher to finish the Supabase setup.');
-      window.location.href = './classroom.html';
-      return false;
-    }
-    cloudSupabase = module.supabase;
-    const { data: sessionResult, error: sessionError } = await cloudSupabase.auth.getSession();
-    if (sessionError) throw sessionError;
-    const user = sessionResult?.session?.user;
-    if (!user) {
-      showToast('Please log in to your student account to open this assigned story.');
-      window.location.href = './classroom.html';
-      return false;
-    }
-    const { data: profile, error: profileError } = await cloudSupabase
-      .from('profiles').select('id,role').eq('id', user.id).maybeSingle();
-    if (profileError) throw profileError;
-    if (!profile || profile.role !== 'student') {
-      showToast('This assigned-story link is for a student account.');
-      window.location.href = './classroom.html';
-      return false;
-    }
-    const { data: membership, error: membershipError } = await cloudSupabase
-      .from('class_members').select('class_id').eq('class_id', classId).eq('student_id', user.id).maybeSingle();
-    if (membershipError) throw membershipError;
-    if (!membership) {
-      showToast('You are not a member of this class. Join with the code from your teacher first.');
-      window.location.href = './classroom.html';
-      return false;
-    }
-    if (storyId) {
-      const { data: assignment, error: assignmentError } = await cloudSupabase
-        .from('story_assignments').select('story_id').eq('class_id', classId).eq('story_id', storyId).maybeSingle();
-      if (assignmentError) throw assignmentError;
-      if (!assignment) {
-        showToast('This story is not assigned to your classroom yet.');
-        window.location.href = './classroom.html';
-        return false;
-      }
-    }
-    cloudStudentId = user.id;
-    cloudClassId = classId;
-    return true;
-  } catch (error) {
-    console.error('STORYVERSE class verification failed:', error);
-    showToast('Could not verify classroom access. Please return to Classroom Login and try again.');
-    window.location.href = './classroom.html';
-    return false;
-  }
-}
-
-async function syncCloudSceneProgress(scenesCompleted) {
-  if (!cloudSupabase || !cloudStudentId || !cloudClassId || !activeStory) return;
-  const { error } = await cloudSupabase.rpc('record_storyverse_scene_progress', {
-    p_class_id: cloudClassId,
-    p_story_id: activeStory.id,
-    p_scenes_completed: Math.max(1, Math.min(3, scenesCompleted)),
-  });
-  if (error) {
-    console.error('Could not sync scene progress:', error);
-    showToast('Saved on this device, but classroom progress did not sync. Check your connection.');
-  }
-}
-
-
 async function loadStories() {
   const response = await fetch('./data/stories.json', { cache: 'no-cache' });
   if (!response.ok) throw new Error('Could not load story content.');
@@ -220,13 +161,9 @@ async function loadStories() {
   validateStoryData(storyData);
   renderStoryLibrary();
   renderProgress();
+  if (signedInProfile?.role === 'student') void syncStudentProgress();
   const params = new URLSearchParams(location.search);
   const storyId = params.get('story');
-  const classId = params.get('class');
-  if (classId) {
-    const verified = await initializeCloudClass(classId, storyId);
-    if (!verified) return;
-  }
   if (storyId && findStory(storyId)) setTimeout(() => openStory(storyId), 500);
 }
 function validateStoryData(data) {
@@ -237,7 +174,8 @@ function validateStoryData(data) {
     }
     for (const scene of story.scenes) if (!scene.title || !scene.text) throw new Error(`A scene in "${story.title}" is missing a title or text.`);
     for (const question of story.quiz) {
-      if (!question.question || !Array.isArray(question.choices) || question.choices.length < 2) throw new Error(`A quiz question in "${story.title}" is incomplete.`);
+      if (!question.question || !Array.isArray(question.choices) || !Number.isInteger(question.answer)) throw new Error(`A quiz question in "${story.title}" is incomplete.`);
+      if (question.answer < 0 || question.answer >= question.choices.length) throw new Error(`A quiz answer in "${story.title}" points outside its choice list.`);
     }
   }
 }
@@ -325,7 +263,7 @@ function nextScene() {
   const prior = Number(currentProgress.scenes[activeStory.id] || 0);
   currentProgress.scenes[activeStory.id] = Math.max(prior, activeScene + 1);
   saveProgress();
-  void syncCloudSceneProgress(currentProgress.scenes[activeStory.id]);
+  void syncStudentProgress(activeStory.id);
   renderProgress();
   if (activeScene < 2) {
     activeScene += 1;
@@ -778,95 +716,55 @@ function renderQuizQuestion() {
     $$('[data-answer]').forEach(el => el.classList.toggle('selected', el === button));
     $('#quizNext').disabled = false;
   }));
-  $('#quizNext').textContent = 'SAVE ANSWER';
+  $('#quizNext').textContent = 'CHECK ANSWER';
   $('#quizNext').disabled = true;
 }
-async function quizAdvance() {
+function quizAdvance() {
   if (!quizState) return;
   if (!quizState.answered) {
     if (quizState.selected === null) return;
     const q = quizState.story.quiz[quizState.index];
-    quizState.responses.push({
-      selected: quizState.selected,
-      question: q.question,
-      choices: q.choices,
-      explanation: q.explanation || '',
-    });
+    const correct = quizState.selected === q.answer;
+    if (correct) quizState.score++;
+    quizState.responses.push({ correct, explanation: q.explanation, question: q.question });
     quizState.answered = true;
-    $$('[data-answer]').forEach(button => { button.disabled = true; });
+    $$('[data-answer]').forEach(button => {
+      const value = Number(button.dataset.answer);
+      button.disabled = true;
+      if (value === q.answer) button.classList.add('correct-answer');
+      else if (value === quizState.selected) button.classList.add('wrong-answer');
+    });
     const feedback = $('#answerFeedback');
     feedback.hidden = false;
-    feedback.className = 'answer-feedback';
-    feedback.textContent = cloudSupabase && cloudStudentId && cloudClassId
-      ? 'Answer saved. Your teacher’s classroom will score the full quiz when you submit it.'
-      : 'Answer saved for this practice session. Join your teacher’s classroom and open the assigned story to submit a scored quiz.';
-    $('#quizNext').textContent = quizState.index === quizState.story.quiz.length - 1 ? 'SUBMIT QUIZ' : 'NEXT QUESTION';
+    feedback.className = `answer-feedback ${correct ? 'good' : 'bad'}`;
+    feedback.innerHTML = `<b>${correct ? 'That’s right!' : 'Not quite yet.'}</b> ${escapeHtml(q.explanation)}`;
+    $('#quizNext').textContent = quizState.index === quizState.story.quiz.length - 1 ? 'SEE MY SCORE' : 'NEXT QUESTION';
   } else if (quizState.index < quizState.story.quiz.length - 1) {
     quizState.index++;
     renderQuizQuestion();
-  } else {
-    await showQuizResult();
-  }
+  } else showQuizResult();
 }
-
-async function showQuizResult() {
+function showQuizResult() {
   quizState.finished = true;
   const total = quizState.story.quiz.length;
-  let score = null;
-  let submitMessage = '';
-
-  $('#quizNext').disabled = true;
-  $('#quizNext').textContent = 'SUBMITTING…';
-
-  if (cloudSupabase && cloudStudentId && cloudClassId) {
-    try {
-      const answers = quizState.responses.map(item => item.selected);
-      const { data, error } = await cloudSupabase.rpc('submit_storyverse_quiz', {
-        p_class_id: cloudClassId,
-        p_story_id: quizState.story.id,
-        p_answers: answers,
-      });
-      if (error) throw error;
-      const result = Array.isArray(data) ? data[0] : data;
-      if (!result || !Number.isInteger(Number(result.score)) || !Number.isInteger(Number(result.total))) {
-        throw new Error('The server returned an incomplete quiz result.');
-      }
-      score = Number(result.score);
-      submitMessage = 'Your scored result has been saved to your classroom.';
-    } catch (error) {
-      console.error('Quiz submission failed:', error);
-      submitMessage = 'We could not submit this quiz to your classroom. Check your internet connection, then ask your teacher to refresh the class dashboard. Your answers have not been counted as a saved score.';
-      showToast('Quiz score did not sync to your classroom.');
-    }
-  } else {
-    submitMessage = 'Practice session only. To record a score your teacher can see, log in, join a class with its code, and open this story from the assigned-stories list.';
-  }
-
+  const score = quizState.score;
+  const pct = Math.round(score / total * 100);
   currentProgress.completed = [...new Set([...(currentProgress.completed || []), quizState.story.id])];
-  if (score !== null) {
-    currentProgress.results = currentProgress.results || [];
-    currentProgress.results.unshift({ storyId: quizState.story.id, title: quizState.story.title, score, total, date: new Date().toISOString() });
-    currentProgress.results = currentProgress.results.slice(0, 12);
-  }
+  currentProgress.results = currentProgress.results || [];
+  currentProgress.results.unshift({ storyId: quizState.story.id, title: quizState.story.title, score, total, date: new Date().toISOString() });
+  currentProgress.results = currentProgress.results.slice(0, 12);
   saveProgress();
+  void syncStudentProgress(quizState.story.id);
   renderProgress();
-
-  const pct = score === null ? null : Math.round(score / total * 100);
-  $('#quizQuestionCounter').textContent = score === null ? 'PRACTICE SESSION' : 'YOUR STORYVERSE RESULT';
+  $('#quizQuestionCounter').textContent = 'YOUR STORYVERSE RESULT';
   $('#quizProgressLabel').textContent = '100%';
   $('#quizProgressBar').style.width = '100%';
   $('#quizContent').hidden = true;
   $('#quizNext').hidden = true;
   const result = $('#quizResult');
   result.hidden = false;
-
-  const reviewHtml = quizState.responses.map((response) =>
-    `<div class="review-line">${escapeHtml(response.question)}<br/><span>Your answer: ${escapeHtml(response.choices[response.selected] || 'No answer')}</span><br/><span>${escapeHtml(response.explanation)}</span></div>`
-  ).join('');
-
-  const headline = score === null ? 'Quiz submitted status unavailable' : `${score} / ${total}`;
-  const performance = pct === null ? 'Practice mode' : `${pct}% · ${pct >= 80 ? 'STORY EXPLORER' : pct >= 60 ? 'CURIOUS READER' : 'KEEP PRACTISING'}`;
-  result.innerHTML = `<strong>${headline}</strong><p><b>${performance}</b><br/>${escapeHtml(submitMessage)}</p><div class="quiz-review">${reviewHtml}</div>`;
+  const message = pct >= 80 ? 'Excellent reading! You caught the important details and the bigger meaning.' : pct >= 60 ? 'Nice work! Review the explanations and notice what the story is teaching.' : 'Good effort. Revisit the scenes and try again to strengthen your understanding.';
+  result.innerHTML = `<strong>${score} / ${total}</strong><p><b>${pct}% · ${pct >= 80 ? 'STORY EXPLORER' : pct >= 60 ? 'CURIOUS READER' : 'KEEP PRACTISING'}</b><br/>${message}</p><div class="quiz-review">${quizState.responses.map((r,i)=>`<div class="review-line ${r.correct?'good':'bad'}">${r.correct?'✓':'↻'} ${escapeHtml(r.question)} — ${escapeHtml(r.explanation)}</div>`).join('')}</div>`;
   const done = document.createElement('button');
   done.className = 'button button-primary';
   done.textContent = 'BACK TO STORYVERSE';
@@ -889,7 +787,9 @@ function renderProgress() {
   $('#statStories').textContent = `${completed}`;
   $('#statScenes').textContent = `${scenes}/${totalStories*3}`;
   $('#statAverage').textContent = avg === null ? '—' : `${avg}%`;
-  $('#studentName').value = currentProgress.name || '';
+  $('#studentName').value = signedInProfile?.displayName || currentProgress.name || '';
+  $('#studentName').placeholder = signedInUser ? 'Your account name' : 'Sign in to see your name';
+  $('#profileSyncNote').textContent = signedInUser ? 'Your progress is connected to your STORYVERSE account.' : 'Progress is stored on this device until you sign in.';
   $('#storyProgressList').innerHTML = storyData.stories.map(story=>{
     const count = Math.min(3,Number(currentProgress.scenes?.[story.id]||0));
     return `<div class="progress-row"><span class="progress-row-title">${escapeHtml(story.title)}</span><small>${count}/3 scenes</small><div class="progress-bar"><span style="width:${count/3*100}%"></span></div></div>`;
@@ -1014,6 +914,390 @@ function downloadStoriesJson() {
   }
 }
 
+
+
+// ---------------- STORYVERSE accounts + private classrooms ----------------
+function firebaseConfiguredMessage() {
+  return 'Firebase is not connected yet. Complete the Firebase setup and add your web-app config to firebase-config.js.';
+}
+function openAuthModal(mode = 'login') {
+  setAuthMode(mode);
+  $('#authName').value = '';
+  $('#authPassword').value = '';
+  $('#authConfirm').value = '';
+  $('#authError').textContent = '';
+  $('#authError').className = 'auth-error';
+  openModal('authModal');
+}
+function setAuthMode(mode) {
+  authMode = mode === 'register' ? 'register' : 'login';
+  $$('[data-auth-mode]').forEach(button => button.classList.toggle('active', button.dataset.authMode === authMode));
+  $('#authTitle').innerHTML = authMode === 'register' ? 'Create your <em>account.</em>' : 'Welcome <em>back.</em>';
+  $('#authIntro').textContent = authMode === 'register'
+    ? 'Choose your role, then create your name-and-password account.'
+    : 'Log in with your name and password to continue your reading journey.';
+  $('#authRoleWrap').hidden = authMode !== 'register';
+  $('#authConfirmWrap').hidden = authMode !== 'register';
+  $('#authPassword').setAttribute('autocomplete', authMode === 'register' ? 'new-password' : 'current-password');
+  $('#authSubmit').textContent = authMode === 'register' ? 'CREATE ACCOUNT' : 'LOG IN';
+  $('#authError').textContent = '';
+}
+function normalizeAccountName(name) {
+  return String(name || '').normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('en');
+}
+async function accountEmailForName(name) {
+  const normalized = normalizeAccountName(name);
+  if (!normalized) throw new Error('Enter your name first.');
+  const bytes = new TextEncoder().encode(normalized);
+  let digest;
+  if (globalThis.crypto?.subtle) {
+    digest = await crypto.subtle.digest('SHA-256', bytes);
+    const hex = [...new Uint8Array(digest)].map(value => value.toString(16).padStart(2, '0')).join('');
+    return `sv-${hex}@storyverse.invalid`;
+  }
+  // Fallback for older browsers; HTTPS browsers normally support Web Crypto.
+  let hash = 2166136261;
+  for (const byte of bytes) { hash ^= byte; hash = Math.imul(hash, 16777619); }
+  return `sv-${(hash >>> 0).toString(16)}-${normalized.length}@storyverse.invalid`;
+}
+function setAuthMessage(message, success = false) {
+  $('#authError').textContent = message || '';
+  $('#authError').className = success ? 'auth-error success' : 'auth-error';
+}
+function firebaseErrorMessage(error) {
+  const code = error?.code || '';
+  const messages = {
+    'auth/email-already-in-use': 'That name is already registered. Try logging in, or use a different unique name.',
+    'auth/invalid-credential': 'The name or password is incorrect.',
+    'auth/user-not-found': 'No account was found with that name. Create an account first.',
+    'auth/wrong-password': 'The name or password is incorrect.',
+    'auth/weak-password': 'Choose a password with at least 8 characters.',
+    'auth/operation-not-allowed': 'Enable Email/Password sign-in in Firebase Authentication settings.',
+    'auth/network-request-failed': 'Network problem. Check your internet connection and try again.',
+    'permission-denied': 'Firebase blocked this action. Check that the Firestore security rules were published.'
+  };
+  return messages[code] || error?.message || 'Something went wrong. Please try again.';
+}
+async function initializeFirebase() {
+  if (!isFirebaseConfigured) {
+    updateAccountButton();
+    renderClassroomPanel();
+    return;
+  }
+  try {
+    const version = FIREBASE_SDK_VERSION;
+    const [appModule, authModule, firestoreModule] = await Promise.all([
+      import(`https://www.gstatic.com/firebasejs/${version}/firebase-app.js`),
+      import(`https://www.gstatic.com/firebasejs/${version}/firebase-auth.js`),
+      import(`https://www.gstatic.com/firebasejs/${version}/firebase-firestore.js`)
+    ]);
+    const firebaseApp = appModule.initializeApp(firebaseConfig);
+    firebaseAuth = authModule.getAuth(firebaseApp);
+    firebaseDb = firestoreModule.getFirestore(firebaseApp);
+    firebaseApi = { ...authModule, ...firestoreModule };
+    authModule.onAuthStateChanged(firebaseAuth, async user => {
+      if (authActionInProgress) return;
+      await handleAuthState(user);
+    });
+  } catch (error) {
+    console.error('Firebase initialization failed:', error);
+    updateAccountButton();
+    renderClassroomPanel('Firebase could not connect. Check your firebase-config.js values and internet connection.');
+  }
+}
+async function handleAuthSubmit(event) {
+  event.preventDefault();
+  if (!isFirebaseConfigured || !firebaseAuth || !firebaseDb) {
+    setAuthMessage(firebaseConfiguredMessage());
+    return;
+  }
+  const name = $('#authName').value.trim();
+  const password = $('#authPassword').value;
+  if (name.length < 2) return setAuthMessage('Enter a name with at least 2 characters.');
+  if (password.length < 8) return setAuthMessage('Use a password with at least 8 characters.');
+  const button = $('#authSubmit');
+  button.disabled = true;
+  button.textContent = authMode === 'register' ? 'CREATING…' : 'LOGGING IN…';
+  try {
+    const email = await accountEmailForName(name);
+    authActionInProgress = true;
+    if (authMode === 'register') {
+      const confirm = $('#authConfirm').value;
+      if (password !== confirm) throw new Error('Your passwords do not match.');
+      const role = $('#authRole').value === 'teacher' ? 'teacher' : 'student';
+      const credential = await firebaseApi.createUserWithEmailAndPassword(firebaseAuth, email, password);
+      try {
+        await firebaseApi.setDoc(firebaseApi.doc(firebaseDb, 'users', credential.user.uid), {
+          displayName: name.replace(/\s+/g, ' ').slice(0, 70),
+          role,
+          joinedClassCodes: [],
+          createdAt: firebaseApi.serverTimestamp()
+        });
+      } catch (profileError) {
+        await firebaseApi.deleteUser(credential.user).catch(() => {});
+        throw profileError;
+      }
+      authActionInProgress = false;
+      await handleAuthState(credential.user);
+      closeModal('authModal');
+      showToast(`Welcome to STORYVERSE, ${name}!`);
+    } else {
+      const credential = await firebaseApi.signInWithEmailAndPassword(firebaseAuth, email, password);
+      authActionInProgress = false;
+      await handleAuthState(credential.user);
+      closeModal('authModal');
+      showToast(`Welcome back, ${signedInProfile?.displayName || name}!`);
+    }
+  } catch (error) {
+    authActionInProgress = false;
+    setAuthMessage(firebaseErrorMessage(error));
+  } finally {
+    button.disabled = false;
+    button.textContent = authMode === 'register' ? 'CREATE ACCOUNT' : 'LOG IN';
+  }
+}
+async function handleAuthState(user) {
+  signedInUser = user || null;
+  signedInProfile = null;
+  if (!user) {
+    currentProgress = readProgress(STORAGE_KEY);
+    updateAccountButton();
+    renderProgress();
+    await renderClassroomPanel();
+    return;
+  }
+  try {
+    const profileSnap = await firebaseApi.getDoc(firebaseApi.doc(firebaseDb, 'users', user.uid));
+    if (!profileSnap.exists()) throw new Error('Your account profile is missing. Please contact the project editor.');
+    signedInProfile = profileSnap.data();
+    currentProgress = readProgress(`${STORAGE_KEY}-${user.uid}`);
+    currentProgress.name = signedInProfile.displayName || '';
+    await loadCloudProgress();
+    saveProgress();
+    updateAccountButton();
+    renderProgress();
+    await renderClassroomPanel();
+    if (signedInProfile.role === 'student') void syncStudentProgress();
+  } catch (error) {
+    console.error('Could not load account profile:', error);
+    showToast(firebaseErrorMessage(error));
+  }
+}
+async function logoutAccount() {
+  if (!firebaseAuth) return;
+  try {
+    await firebaseApi.signOut(firebaseAuth);
+    showToast('You are now signed out.');
+  } catch (error) { showToast(firebaseErrorMessage(error)); }
+}
+function updateAccountButton() {
+  const button = $('#accountButton');
+  if (!button) return;
+  button.textContent = signedInUser ? `LOG OUT · ${(signedInProfile?.displayName || 'ACCOUNT').toLocaleUpperCase().slice(0, 15)}` : 'LOG IN / SIGN UP';
+  button.title = signedInUser ? 'Sign out of STORYVERSE' : 'Log in or create a STORYVERSE account';
+}
+async function loadCloudProgress() {
+  if (!signedInUser || !firebaseDb) return;
+  const snap = await firebaseApi.getDocs(firebaseApi.collection(firebaseDb, 'users', signedInUser.uid, 'progress'));
+  const scenes = { ...(currentProgress.scenes || {}) };
+  const completed = new Set(currentProgress.completed || []);
+  const results = [];
+  snap.forEach(docSnap => {
+    const record = docSnap.data();
+    scenes[docSnap.id] = Math.max(Number(scenes[docSnap.id] || 0), Number(record.scenesCompleted || 0));
+    if (record.completed) completed.add(docSnap.id);
+    (record.attempts || []).forEach(attempt => results.push({ storyId: docSnap.id, title: record.title || docSnap.id, score: Number(attempt.score || 0), total: Number(attempt.total || 0), date: attempt.date || new Date().toISOString() }));
+  });
+  currentProgress.scenes = scenes;
+  currentProgress.completed = [...completed];
+  currentProgress.results = [...results, ...(currentProgress.results || [])]
+    .filter((item, index, all) => all.findIndex(other => other.storyId === item.storyId && other.date === item.date && other.score === item.score) === index)
+    .sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 40);
+}
+function syncStudentProgress(storyId = null) {
+  if (!signedInUser || signedInProfile?.role !== 'student' || !firebaseDb) return Promise.resolve();
+  progressSyncQueue = progressSyncQueue.then(() => performStudentProgressSync(storyId)).catch(error => {
+    console.error('Student progress sync failed:', error);
+    showToast('Your progress is saved on this device, but could not sync to the classroom. Check your connection and try Refresh.');
+  });
+  return progressSyncQueue;
+}
+async function performStudentProgressSync(storyId = null) {
+  if (!signedInUser || signedInProfile?.role !== 'student' || !firebaseDb) return;
+  const stories = storyId ? (storyData?.stories || []).filter(item => item.id === storyId) : (storyData?.stories || []);
+  const joinedCodes = signedInProfile.joinedClassCodes || [];
+  for (const story of stories) {
+    const attempts = (currentProgress.results || []).filter(item => item.storyId === story.id).slice(0, 20).map(item => ({ score: Number(item.score || 0), total: Number(item.total || 0), date: item.date || new Date().toISOString() }));
+    const record = {
+      storyId: story.id,
+      title: story.title,
+      scenesCompleted: Math.min(3, Number(currentProgress.scenes?.[story.id] || 0)),
+      completed: (currentProgress.completed || []).includes(story.id),
+      attempts,
+      latestScore: attempts[0]?.score ?? null,
+      latestTotal: attempts[0]?.total ?? null,
+      latestPercent: attempts[0] && attempts[0].total ? Math.round(attempts[0].score / attempts[0].total * 100) : null,
+      updatedAt: firebaseApi.serverTimestamp()
+    };
+    await firebaseApi.setDoc(firebaseApi.doc(firebaseDb, 'users', signedInUser.uid, 'progress', story.id), record, { merge: true });
+    for (const code of joinedCodes) {
+      await firebaseApi.setDoc(firebaseApi.doc(firebaseDb, 'classrooms', code, 'members', signedInUser.uid, 'progress', story.id), record, { merge: true });
+    }
+  }
+}
+function generateClassCode() {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  return [...bytes].map(byte => alphabet[byte % alphabet.length]).join('');
+}
+async function handleClassroomSubmit(event) {
+  const form = event.target.closest('form[data-classroom-form]');
+  if (!form) return;
+  event.preventDefault();
+  if (!signedInUser || !signedInProfile) return openAuthModal('login');
+  const status = form.querySelector('.classroom-form-status');
+  const button = form.querySelector('button[type="submit"]');
+  button.disabled = true;
+  try {
+    if (form.dataset.classroomForm === 'create') {
+      if (signedInProfile.role !== 'teacher') throw new Error('Only teacher accounts can create classrooms.');
+      const input = form.querySelector('[name="className"]');
+      const className = input.value.trim();
+      if (className.length < 2) throw new Error('Enter a classroom name with at least 2 characters.');
+      let code = generateClassCode();
+      let ref = firebaseApi.doc(firebaseDb, 'classrooms', code);
+      for (let attempt = 0; attempt < 4 && (await firebaseApi.getDoc(ref)).exists(); attempt++) {
+        code = generateClassCode(); ref = firebaseApi.doc(firebaseDb, 'classrooms', code);
+      }
+      await firebaseApi.setDoc(ref, { ownerUid: signedInUser.uid, teacherName: signedInProfile.displayName, className: className.slice(0, 60), isActive: true, createdAt: firebaseApi.serverTimestamp() });
+      showToast(`Class created! Share code ${code} with your students.`);
+      await renderClassroomPanel();
+    } else if (form.dataset.classroomForm === 'join') {
+      if (signedInProfile.role !== 'student') throw new Error('Teacher accounts cannot join a classroom as students.');
+      const code = form.querySelector('[name="classCode"]').value.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+      if (code.length < 6) throw new Error('Enter the classroom code shared by your teacher.');
+      if ((signedInProfile.joinedClassCodes || []).includes(code)) throw new Error('You are already in this classroom.');
+      const classRef = firebaseApi.doc(firebaseDb, 'classrooms', code);
+      const classSnap = await firebaseApi.getDoc(classRef);
+      if (!classSnap.exists() || !classSnap.data().isActive) throw new Error('That classroom code was not found or is no longer active. Check the code and try again.');
+      const memberRef = firebaseApi.doc(firebaseDb, 'classrooms', code, 'members', signedInUser.uid);
+      const memberSnap = await firebaseApi.getDoc(memberRef);
+      if (!memberSnap.exists()) await firebaseApi.setDoc(memberRef, { uid: signedInUser.uid, studentName: signedInProfile.displayName, joinedAt: firebaseApi.serverTimestamp() });
+      await firebaseApi.updateDoc(firebaseApi.doc(firebaseDb, 'users', signedInUser.uid), { joinedClassCodes: firebaseApi.arrayUnion(code) });
+      signedInProfile.joinedClassCodes = [...new Set([...(signedInProfile.joinedClassCodes || []), code])];
+      await syncStudentProgress();
+      showToast(`You joined ${classSnap.data().className}!`);
+      await renderClassroomPanel();
+    }
+  } catch (error) {
+    if (status) status.textContent = firebaseErrorMessage(error);
+    else showToast(firebaseErrorMessage(error));
+  } finally { button.disabled = false; }
+}
+async function handleClassroomClick(event) {
+  const copyButton = event.target.closest('[data-copy-class]');
+  if (copyButton) {
+    const code = copyButton.dataset.copyClass;
+    try { await navigator.clipboard.writeText(code); showToast('Class code copied.'); }
+    catch { showToast(`Class code: ${code}`); }
+  }
+  const refreshButton = event.target.closest('[data-refresh-classrooms]');
+  if (refreshButton) await renderClassroomPanel();
+}
+function renderClassroomPanel(message = '') {
+  const panel = $('#classroomPanel');
+  if (!panel) return;
+  if (!signedInUser || !signedInProfile) {
+    panel.innerHTML = `<div class="classroom-empty"><div class="classroom-empty-icon">✦</div><h3>${message ? 'Connect your classroom.' : 'Your STORYVERSE classroom starts here.'}</h3><p>${escapeHtml(message || (isFirebaseConfigured ? 'Log in or create a teacher or student account to open your private learning space.' : 'Finish connecting Firebase to activate accounts, class codes, and synced progress. Your stories remain available while you set it up.'))}</p><button class="button button-primary" id="classroomLoginButton">LOG IN / CREATE ACCOUNT</button></div>`;
+    $('#classroomLoginButton')?.addEventListener('click', () => openAuthModal('login'));
+    return;
+  }
+  if (signedInProfile.role === 'teacher') {
+    panel.innerHTML = `<div class="classroom-head"><div><span class="classroom-eyebrow">TEACHER WORKSPACE</span><h3>Hello, ${escapeHtml(signedInProfile.displayName)}.</h3><p>Create a private classroom and share its code with your students. Only enrolled students' reading data appears here.</p></div><div><span class="classroom-user-pill">TEACHER ACCOUNT</span><button type="button" class="button button-secondary classroom-refresh" data-refresh-classrooms>REFRESH DATA ↻</button></div></div><div class="classroom-actions"><div class="classroom-action-card"><h4>Create a classroom</h4><p>Each classroom has its own private join code.</p><form class="classroom-form" data-classroom-form="create"><input name="className" maxlength="60" placeholder="Example: Grade 8 – English" required/><button class="button button-primary" type="submit">CREATE CLASS</button></form><div class="classroom-form-status" role="status"></div></div><div class="classroom-action-card"><h4>What you can monitor</h4><p>Student names, completed scenes, quiz attempts, latest scores, and score history are synchronized after students finish each scene or quiz.</p><div class="classroom-footer-note">Use study codes or approved display names for student accounts. Share each class code only with the intended class.</div></div></div><div class="classroom-list" id="teacherClassList"><p class="classroom-empty-note">Loading your classrooms…</p></div>`;
+    void loadTeacherClassrooms();
+  } else {
+    panel.innerHTML = `<div class="classroom-head"><div><span class="classroom-eyebrow">STUDENT WORKSPACE</span><h3>Welcome, ${escapeHtml(signedInProfile.displayName)}.</h3><p>Join your teacher's private class with the code they shared. Your quiz and reading progress will be visible to that classroom's teacher.</p></div><div><span class="classroom-user-pill">STUDENT ACCOUNT</span><button type="button" class="button button-secondary classroom-refresh" data-refresh-classrooms>REFRESH DATA ↻</button></div></div><div class="classroom-action-card"><h4>Join a classroom</h4><p>Ask your teacher for the private class code.</p><form class="classroom-form" data-classroom-form="join"><input name="classCode" maxlength="12" placeholder="Enter class code" autocomplete="off" required/><button class="button button-primary" type="submit">JOIN CLASS</button></form><div class="classroom-form-status" role="status"></div></div><div class="classroom-list" id="studentClassList"><p class="classroom-empty-note">Loading your classrooms…</p></div>`;
+    void loadStudentClassrooms();
+  }
+}
+async function loadTeacherClassrooms() {
+  if (!signedInUser || signedInProfile?.role !== 'teacher' || !firebaseDb) return;
+  const token = ++classroomRefreshToken;
+  const host = $('#teacherClassList');
+  if (!host) return;
+  try {
+    const classQuery = firebaseApi.query(firebaseApi.collection(firebaseDb, 'classrooms'), firebaseApi.where('ownerUid', '==', signedInUser.uid));
+    const classSnap = await firebaseApi.getDocs(classQuery);
+    if (token !== classroomRefreshToken || !$('#teacherClassList')) return;
+    if (classSnap.empty) { host.innerHTML = '<p class="classroom-empty-note">No classrooms yet. Create your first class above, then share its code with students.</p>'; return; }
+    const records = [];
+    for (const classDoc of classSnap.docs) {
+      const classroom = classDoc.data();
+      const membersSnap = await firebaseApi.getDocs(firebaseApi.collection(firebaseDb, 'classrooms', classDoc.id, 'members'));
+      const students = [];
+      let percentTotal = 0, percentCount = 0, sceneTotal = 0;
+      for (const memberDoc of membersSnap.docs) {
+        const member = memberDoc.data();
+        const progressSnap = await firebaseApi.getDocs(firebaseApi.collection(firebaseDb, 'classrooms', classDoc.id, 'members', memberDoc.id, 'progress'));
+        const allAttempts = [];
+        let studentScenes = 0, storiesDone = 0;
+        progressSnap.forEach(progressDoc => {
+          const progress = progressDoc.data();
+          studentScenes += Math.min(3, Number(progress.scenesCompleted || 0));
+          if (progress.completed) storiesDone++;
+          (progress.attempts || []).forEach(attempt => allAttempts.push({ ...attempt, title: progress.title || progressDoc.id }));
+        });
+        allAttempts.sort((a,b)=>new Date(b.date)-new Date(a.date));
+        const latest = allAttempts[0];
+        if (latest && latest.total) { percentTotal += latest.score/latest.total*100; percentCount++; }
+        sceneTotal += studentScenes;
+        students.push({ name: member.studentName || 'Student', scenes: studentScenes, storiesDone, latest, attempts: allAttempts });
+      }
+      records.push({ code: classDoc.id, ...classroom, students, average: percentCount ? Math.round(percentTotal/percentCount) : null, sceneTotal });
+    }
+    host.innerHTML = records.map(classroom => {
+      const rows = classroom.students.length ? classroom.students.map(student => {
+        const ordered = [...student.attempts].sort((a,b)=>new Date(a.date)-new Date(b.date));
+        const trend = ordered.length ? ordered.map(attempt => attempt.total ? `${Math.round(attempt.score/attempt.total*100)}%` : '—').join(' → ') : 'No results yet';
+        return `<tr><td>${escapeHtml(student.name)}</td><td>${student.storiesDone}</td><td>${student.scenes}/9</td><td class="classroom-score">${student.latest && student.latest.total ? `${Math.round(student.latest.score/student.latest.total*100)}%` : '—'}</td><td>${student.attempts.length}</td><td>${escapeHtml(trend)}</td></tr>`;
+      }).join('') : '<tr><td colspan="6">No students have joined this classroom yet.</td></tr>';
+      return `<article class="classroom-card"><div class="classroom-card-top"><div><h4>${escapeHtml(classroom.className || 'Untitled classroom')}</h4><small>${classroom.students.length} student${classroom.students.length===1?'':'s'} · Created classroom</small></div><div class="classroom-code">${escapeHtml(classroom.code)} <button type="button" data-copy-class="${escapeHtml(classroom.code)}">COPY</button></div></div><div class="classroom-card-metrics"><span class="classroom-metric">Students <b>${classroom.students.length}</b></span><span class="classroom-metric">Scenes completed <b>${classroom.sceneTotal}</b></span><span class="classroom-metric">Latest-score average <b>${classroom.average === null ? '—' : `${classroom.average}%`}</b></span></div><div class="classroom-table-wrap"><table class="classroom-table"><thead><tr><th>STUDENT</th><th>STORIES</th><th>SCENES</th><th>LATEST SCORE</th><th>ATTEMPTS</th><th>SCORE TREND · OLD TO NEW</th></tr></thead><tbody>${rows}</tbody></table></div><p class="classroom-footer-note">Score history is retained per student. Use the trend column to compare older and newer quiz attempts. Press Refresh data to fetch the latest classroom activity.</p></article>`;
+    }).join('');
+  } catch (error) {
+    console.error('Teacher classroom load failed:', error);
+    if (host) host.innerHTML = `<p class="classroom-empty-note">Could not load your classes: ${escapeHtml(firebaseErrorMessage(error))}</p>`;
+  }
+}
+async function loadStudentClassrooms() {
+  if (!signedInUser || signedInProfile?.role !== 'student' || !firebaseDb) return;
+  const host = $('#studentClassList');
+  if (!host) return;
+  const codes = signedInProfile.joinedClassCodes || [];
+  if (!codes.length) { host.innerHTML = '<p class="classroom-empty-note">You have not joined a classroom yet. Enter your teacher’s code above. You can still explore stories while you wait.</p>'; return; }
+  try {
+    const cards = [];
+    for (const code of codes) {
+      const classSnap = await firebaseApi.getDoc(firebaseApi.doc(firebaseDb, 'classrooms', code));
+      if (!classSnap.exists()) continue;
+      const classroom = classSnap.data();
+      const progressSnap = await firebaseApi.getDocs(firebaseApi.collection(firebaseDb, 'classrooms', code, 'members', signedInUser.uid, 'progress'));
+      let scenes = 0, complete = 0, attempts = 0, score = 0, total = 0;
+      progressSnap.forEach(docSnap => {
+        const item = docSnap.data();
+        scenes += Math.min(3, Number(item.scenesCompleted || 0));
+        if (item.completed) complete++;
+        (item.attempts || []).forEach(attempt => { attempts++; score += Number(attempt.score || 0); total += Number(attempt.total || 0); });
+      });
+      cards.push(`<article class="classroom-card"><div class="classroom-card-top"><div><h4>${escapeHtml(classroom.className || 'Classroom')}</h4><small>Teacher: ${escapeHtml(classroom.teacherName || 'Teacher')}</small></div><span class="classroom-join-code">${escapeHtml(code)}</span></div><div class="classroom-card-metrics"><span class="classroom-metric">Scenes completed <b>${scenes}/9</b></span><span class="classroom-metric">Stories completed <b>${complete}</b></span><span class="classroom-metric">Quiz average <b>${total ? `${Math.round(score/total*100)}%` : '—'}</b></span></div><p class="classroom-footer-note">Your progress is synchronized with this classroom's teacher dashboard.</p></article>`);
+    }
+    host.innerHTML = cards.join('') || '<p class="classroom-empty-note">Your classrooms could not be found. Check with your teacher for an updated code.</p>';
+  } catch (error) {
+    console.error('Student classroom load failed:', error);
+    host.innerHTML = `<p class="classroom-empty-note">Could not load your classrooms: ${escapeHtml(firebaseErrorMessage(error))}</p>`;
+  }
+}
+
 function wireEvents() {
   $('#heroScan').addEventListener('click',openScanner);
   $('#navScan').addEventListener('click',openScanner);
@@ -1027,11 +1311,17 @@ function wireEvents() {
   $('#musicToggle').addEventListener('click',toggleMusic);
   $('#pronounceButton').addEventListener('click',()=>showToast('Tap a vocabulary word above to hear it pronounced.'));
   $('#saveName').addEventListener('click',()=>{
-    currentProgress.name = $('#studentName').value.trim().slice(0,24);
-    saveProgress();
-    showToast(`Welcome, ${currentProgress.name || 'story explorer'}!`);
+    if (!signedInUser) openAuthModal('login');
+    else showToast(`Signed in as ${signedInProfile?.displayName || 'STORYVERSE reader'}.`);
   });
-  $('#studentName').addEventListener('keydown',event=>{if(event.key==='Enter')$('#saveName').click();});
+  $('#accountButton').addEventListener('click',()=> signedInUser ? logoutAccount() : openAuthModal('login'));
+  $('#classroomLoginButton').addEventListener('click',()=>openAuthModal('login'));
+  $('#closeAuth').addEventListener('click',()=>closeModal('authModal'));
+  $$('[data-close="auth"]').forEach(el=>el.addEventListener('click',()=>closeModal('authModal')));
+  $$('[data-auth-mode]').forEach(button=>button.addEventListener('click',()=>setAuthMode(button.dataset.authMode)));
+  $('#authForm').addEventListener('submit',handleAuthSubmit);
+  $('#classroomPanel').addEventListener('submit',handleClassroomSubmit);
+  $('#classroomPanel').addEventListener('click',handleClassroomClick);
   $('#quizNext').addEventListener('click',quizAdvance);
   $('#openEditor').addEventListener('click',openEditor);
   $('#closeEditor').addEventListener('click',()=>closeModal('editorModal'));
@@ -1052,6 +1342,7 @@ function wireEvents() {
       if($('#scannerModal').classList.contains('open'))$('#closeScanner').click();
       if($('#storyModal').classList.contains('open'))$('#closeStory').click();
       if($('#editorModal').classList.contains('open'))closeModal('editorModal');
+      if($('#authModal').classList.contains('open'))closeModal('authModal');
     }
   });
   window.addEventListener('beforeunload',()=>{stopNarration();stopMusic();disposeThree();});
@@ -1060,6 +1351,7 @@ function wireEvents() {
 $('#yearNow').textContent = new Date().getFullYear();
 currentProgress = currentProgress || {name:'',scenes:{},completed:[],results:[]};
 wireEvents();
+void initializeFirebase();
 window.addEventListener('load', () => { if (storyData?.stories) storyData.stories.forEach(makeQr); });
 loadStories().catch(error=>{
   console.error(error);
