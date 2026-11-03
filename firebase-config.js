@@ -1,13 +1,12 @@
 // STORYVERSE Firebase web-app configuration.
-// Replace every placeholder with the config shown in Firebase Console > Project settings > Your apps.
-// These values identify your Firebase project; Firestore Security Rules protect the actual data.
 export const firebaseConfig = {
-  apiKey: "PASTE_API_KEY_HERE",
-  authDomain: "PASTE_PROJECT_ID.firebaseapp.com",
-  projectId: "PASTE_PROJECT_ID",
-  storageBucket: "PASTE_PROJECT_ID.firebasestorage.app",
-  messagingSenderId: "PASTE_MESSAGING_SENDER_ID",
-  appId: "PASTE_APP_ID"
+  apiKey: "AIzaSyC9eCpY5Eu_AXZElhMJCLeZmbsjZ-6LXXA",
+  authDomain: "storyverse-57dfc.firebaseapp.com",
+  projectId: "storyverse-57dfc",
+  storageBucket: "storyverse-57dfc.firebasestorage.app",
+  messagingSenderId: "948127260871",
+  appId: "1:948127260871:web:feaad7cab464d86193dee2",
+  measurementId: "G-BR7JHQ9EFQ"
 };
 
 export const isFirebaseConfigured = Boolean(
